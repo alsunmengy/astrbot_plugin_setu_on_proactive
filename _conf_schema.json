@@ -1,0 +1,23 @@
+{
+  "commands": {
+    "description": "主动消息触发时自动执行的指令列表，可配多条，逐条投递",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": ["/setu 3 爱弥斯"],
+    "hint": "示例：[\"/setu 3 爱弥斯\", \"/签到\"]。留空则回退到 command 字段或内置默认值。"
+  },
+  "command": {
+    "description": "（旧版兼容）主动消息触发时自动执行的单条指令；已配置 commands 时忽略此项",
+    "type": "string",
+    "default": "/setu 3 爱弥斯",
+    "hint": "旧配置保留兼容，新配置请使用 commands 列表。"
+  },
+  "dedup_window_seconds": {
+    "description": "同一会话去重窗口（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "主动消息分段/TTS 多段发送时，窗口内只投递一次指令，避免重复执行。"
+  }
+}
