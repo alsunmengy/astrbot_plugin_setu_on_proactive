@@ -1,9 +1,11 @@
 # 更新日志
 
+## [1.2.1] - 2026-08-09
+- 补齐市场元数据字段：`repo`、`support_platforms: [lark]`、`short_desc`、`tags`、`social_link`
+
 ## [1.2.0] - 2026-08-09
 - 声明 AstrBot 版本要求：`astrbot_version: >=4.0`，不满足版本的 AstrBot 将提示不支持
 - 版本号规范化为 semver 三段式
-- 补齐市场元数据字段：`repo`、`support_platforms: [lark]`、`short_desc`、`tags`、`social_link`
 
 ## [1.1.1] - 2026-08-09
 - `display_name` 改为中文名「主动消息联动」，方便在插件市场搜索
