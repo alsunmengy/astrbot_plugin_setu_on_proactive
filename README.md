@@ -1,4 +1,4 @@
-# astrbot_plugin_setu_on_proactive
+# astrbot_plugin_setu_on_proactive（主动消息联动）
 
 AstrBot 插件：当**主动消息插件**向会话发送主动消息时，自动向同一会话投递配置好的指令（默认 `/setu 3 爱弥斯` 发图），让 setu 等指令插件像收到用户真实命令一样正常执行。
 
