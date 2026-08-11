@@ -10,6 +10,11 @@
   AstrMessageEvent（message_id 为空）。
 - 本插件注册该钩子，识别伪造事件后，构造一条带正确会话标识的
   `/setu` 命令事件，投递进 AstrBot 事件队列，走完整管道执行。
+
+v1.3.0 新增：
+- delay_before_execute：主动消息触发后延迟 N 秒再投递指令。钩子立即返回，
+  延迟在后台任务执行，不阻塞主动消息本身发送。
+- command_interval：多条指令之间的执行间隔秒数，避免瞬间连发被限流。
 """
 
 from __future__ import annotations
@@ -45,8 +50,13 @@ class SetuOnProactivePlugin(Star):
             self._commands = [_DEFAULT_COMMAND]
         # 同一会话在窗口内只投递一次，防止主动消息分段/TTS 多段触发重复命令
         self._dedup_window = float(cfg.get("dedup_window_seconds", 60))
+        # v1.3.0：延迟执行（秒，负值按 0 处理）
+        self._delay_before_execute = max(0.0, float(cfg.get("delay_before_execute", 0)))
+        self._command_interval = max(0.0, float(cfg.get("command_interval", 0)))
         self._last_trigger: dict[str, float] = {}
         self._lock = asyncio.Lock()
+        # 后台延迟任务引用，防止被 GC；插件重载/卸载时自然取消
+        self._tasks: set[asyncio.Task] = set()
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
@@ -64,21 +74,45 @@ class SetuOnProactivePlugin(Star):
 
             session_key = event.unified_msg_origin
             now = time.time()
+            # 实际去重窗口自动覆盖延迟周期，避免延迟未执行完又来一轮触发导致重复投递
+            exec_span = self._delay_before_execute + self._command_interval * (len(self._commands) - 1)
+            effective_window = max(self._dedup_window, exec_span + 30)
             async with self._lock:
-                if now - self._last_trigger.get(session_key, 0) < self._dedup_window:
+                if now - self._last_trigger.get(session_key, 0) < effective_window:
                     return
                 self._last_trigger[session_key] = now
 
             logger.info(
-                f"[setu_on_proactive] 主动消息触发，投递指令: {self._commands} -> {session_key}"
+                f"[setu_on_proactive] 主动消息触发，投递指令: {self._commands} "
+                f"(延迟 {self._delay_before_execute}s, 间隔 {self._command_interval}s) -> {session_key}"
             )
-            await self._dispatch_commands(event)
+            # 钩子是发送前触发，必须立即返回；延迟投递放到后台任务执行
+            task = asyncio.create_task(self._delayed_dispatch(event, session_key))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[setu_on_proactive] 钩子异常: {e}", exc_info=True)
 
+    async def _delayed_dispatch(self, source_event: AstrMessageEvent, session_key: str) -> None:
+        """延迟后逐条投递指令（后台任务）。"""
+        try:
+            if self._delay_before_execute > 0:
+                logger.info(
+                    f"[setu_on_proactive] 延迟 {self._delay_before_execute}s 后执行 -> {session_key}"
+                )
+                await asyncio.sleep(self._delay_before_execute)
+            await self._dispatch_commands(source_event)
+        except asyncio.CancelledError:
+            logger.info(f"[setu_on_proactive] 延迟任务被取消 -> {session_key}")
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[setu_on_proactive] 延迟执行异常: {e}", exc_info=True)
+
     async def _dispatch_commands(self, source_event: AstrMessageEvent) -> None:
         """逐条构造指令事件并投递到事件队列，走完整管道。"""
-        for command in self._commands:
+        for index, command in enumerate(self._commands):
+            if index > 0 and self._command_interval > 0:
+                await asyncio.sleep(self._command_interval)
             await self._dispatch_command(command, source_event)
 
     async def _dispatch_command(self, command: str, source_event: AstrMessageEvent) -> None:
