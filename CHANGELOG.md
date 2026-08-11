@@ -1,5 +1,8 @@
 # 更新日志
 
+## [1.2.2] - 2026-08-11
+- `support_platforms` 扩展为多平台：aiocqhttp (OneBot v11)、qq_official (QQ官方机器人平台)、telegram、wecom (企业微信应用)、lark (飞书)、dingtalk (钉钉)、kook
+
 ## [1.2.1] - 2026-08-09
 - 补齐市场元数据字段：`repo`、`support_platforms: [lark]`、`short_desc`、`tags`、`social_link`
 
