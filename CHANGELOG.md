@@ -1,5 +1,10 @@
 # 更新日志
 
+## [1.3.0] - 2026-08-11
+- 新增 `delay_before_execute` 配置：主动消息触发后延迟 N 秒再执行指令（钩子立即返回，延迟在后台任务执行，不阻塞主动消息发送）
+- 新增 `command_interval` 配置：多条指令之间按 N 秒间隔逐条执行，避免瞬间连发被限流
+- 去重窗口自动覆盖延迟执行周期，防止延迟期间重复触发
+
 ## [1.2.2] - 2026-08-11
 - `support_platforms` 扩展为多平台：aiocqhttp (OneBot v11)、qq_official (QQ官方机器人平台)、telegram、wecom (企业微信应用)、lark (飞书)、dingtalk (钉钉)、kook
 
