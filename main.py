@@ -21,6 +21,13 @@ v1.4.0 变更（修复 setu 图插进主动消息分段中间）：
   该会话的延迟任务（取消旧任务、新建），只有最后一段触发的任务能存活。
 - delay_before_execute 语义变为：主动消息**最后一段发出后** N 秒再投递指令，
   图永远出现在全部文本段落之后，不再插在分段中间。
+
+v1.4.1 修复（v1.4.0 引入的触发循环）：
+- setu 发图本身也会触发本钩子（伪造事件 message_id 为空且链含 Image），
+  旧逻辑会再次投递 setu → 无限循环（v1.3.0 的 60s 去重窗口恰好挡住了它）。
+- 修复：识别并跳过"非主动消息"的触发——发送者是 bot 自己、或消息链含
+  Image 组件（setu 发图）时直接返回；同时修复旧任务 done_callback 误删
+  新任务的 bug（按对象身份比较）。
 """
 
 from __future__ import annotations
@@ -76,9 +83,24 @@ class SetuOnProactivePlugin(Star):
             # 真实平台事件 message_id 非空；主动消息插件构造的伪造事件为空
             if getattr(msg_obj, "message_id", None):
                 return
-            # 只联动私聊
+            # v1.4.1：只联动私聊
             if not event.is_private_chat():
                 return
+            # v1.4.1：跳过非主动消息的触发——setu 发图也会触发本钩子
+            # （message_id 为空 + 链含 Image），若不排除会无限循环投递 setu。
+            # ① 发送者是 bot 自己 → 跳过（主动消息伪造事件的 sender 是目标用户）
+            sender = getattr(msg_obj, "sender", None)
+            sender_id = getattr(sender, "user_id", None) if sender else None
+            session_id = event.get_session_id()
+            if sender_id is not None and sender_id != session_id:
+                logger.debug(f"[setu_on_proactive] 发送者非目标用户({sender_id})，跳过")
+                return
+            # ② 消息链含图片（setu 发图）→ 跳过
+            chain = getattr(msg_obj, "message", None) or []
+            for comp in chain:
+                if getattr(comp, "type", "") == "image" or comp.__class__.__name__ == "Image":
+                    logger.debug(f"[setu_on_proactive] 链含图片组件，跳过（{comp.__class__.__name__}）")
+                    return
 
             session_key = event.unified_msg_origin
             async with self._lock:
@@ -90,8 +112,10 @@ class SetuOnProactivePlugin(Star):
                     old.cancel()
                 task = asyncio.create_task(self._delayed_dispatch(event, session_key))
                 self._pending_tasks[session_key] = task
+                # v1.4.1：按对象身份清理，避免旧任务的回调误删新任务
                 task.add_done_callback(
                     lambda t, k=session_key: self._pending_tasks.pop(k, None)
+                    if self._pending_tasks.get(k) is t else None
                 )
 
             logger.info(
