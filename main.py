@@ -15,12 +15,17 @@ v1.3.0 新增：
 - delay_before_execute：主动消息触发后延迟 N 秒再投递指令。钩子立即返回，
   延迟在后台任务执行，不阻塞主动消息本身发送。
 - command_interval：多条指令之间的执行间隔秒数，避免瞬间连发被限流。
+
+v1.4.0 变更（修复 setu 图插进主动消息分段中间）：
+- 主动消息插件分段发送时每一段都会触发本钩子。现在每次触发都会**重置**
+  该会话的延迟任务（取消旧任务、新建），只有最后一段触发的任务能存活。
+- delay_before_execute 语义变为：主动消息**最后一段发出后** N 秒再投递指令，
+  图永远出现在全部文本段落之后，不再插在分段中间。
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 import uuid
 
 from astrbot.api import logger
@@ -53,10 +58,13 @@ class SetuOnProactivePlugin(Star):
         # v1.3.0：延迟执行（秒，负值按 0 处理）
         self._delay_before_execute = max(0.0, float(cfg.get("delay_before_execute", 0)))
         self._command_interval = max(0.0, float(cfg.get("command_interval", 0)))
-        self._last_trigger: dict[str, float] = {}
+        # v1.4.0：最小安定时间——即使延迟配 0，也至少等这么久再投递，
+        # 覆盖最后一段消息发送到平台的实际送达空隙（秒）
+        self._min_settle = 2.0
+        # v1.4.0：每会话一个待执行任务。分段/TTS 每段触发都会取消旧任务并重建，
+        # 只有最后一段触发的任务能存活 → 一轮主动消息只投递一次，且投递发生在全部段落发出后
+        self._pending_tasks: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
-        # 后台延迟任务引用，防止被 GC；插件重载/卸载时自然取消
-        self._tasks: set[asyncio.Task] = set()
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
@@ -73,37 +81,40 @@ class SetuOnProactivePlugin(Star):
                 return
 
             session_key = event.unified_msg_origin
-            now = time.time()
-            # 实际去重窗口自动覆盖延迟周期，避免延迟未执行完又来一轮触发导致重复投递
-            exec_span = self._delay_before_execute + self._command_interval * (len(self._commands) - 1)
-            effective_window = max(self._dedup_window, exec_span + 30)
             async with self._lock:
-                if now - self._last_trigger.get(session_key, 0) < effective_window:
-                    return
-                self._last_trigger[session_key] = now
+                # v1.4.0：重置该会话的延迟任务——分段/TTS 每段都会触发本钩子，
+                # 取消旧任务并新建，只有最后一段触发的任务能存活。
+                # 天然实现"一轮主动消息只投递一次" + "投递发生在全部段落发出后"。
+                old = self._pending_tasks.get(session_key)
+                if old and not old.done():
+                    old.cancel()
+                task = asyncio.create_task(self._delayed_dispatch(event, session_key))
+                self._pending_tasks[session_key] = task
+                task.add_done_callback(
+                    lambda t, k=session_key: self._pending_tasks.pop(k, None)
+                )
 
             logger.info(
-                f"[setu_on_proactive] 主动消息触发，投递指令: {self._commands} "
-                f"(延迟 {self._delay_before_execute}s, 间隔 {self._command_interval}s) -> {session_key}"
+                f"[setu_on_proactive] 主动消息触发(重置延迟任务)，投递指令: {self._commands} "
+                f"(最后一段后 {self._delay_before_execute}s, 间隔 {self._command_interval}s) -> {session_key}"
             )
-            # 钩子是发送前触发，必须立即返回；延迟投递放到后台任务执行
-            task = asyncio.create_task(self._delayed_dispatch(event, session_key))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[setu_on_proactive] 钩子异常: {e}", exc_info=True)
 
     async def _delayed_dispatch(self, source_event: AstrMessageEvent, session_key: str) -> None:
         """延迟后逐条投递指令（后台任务）。"""
         try:
-            if self._delay_before_execute > 0:
+            # 从最后一次触发（最后一段）开始计时；再兜底一个最小安定时间
+            wait = max(self._delay_before_execute, self._min_settle)
+            if wait > 0:
                 logger.info(
-                    f"[setu_on_proactive] 延迟 {self._delay_before_execute}s 后执行 -> {session_key}"
+                    f"[setu_on_proactive] 最后一段已触发，{wait}s 后投递 -> {session_key}"
                 )
-                await asyncio.sleep(self._delay_before_execute)
+                await asyncio.sleep(wait)
             await self._dispatch_commands(source_event)
         except asyncio.CancelledError:
-            logger.info(f"[setu_on_proactive] 延迟任务被取消 -> {session_key}")
+            # 被后续分段的新触发重置，属正常流程
+            logger.debug(f"[setu_on_proactive] 延迟任务被新触发重置 -> {session_key}")
             raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"[setu_on_proactive] 延迟执行异常: {e}", exc_info=True)
