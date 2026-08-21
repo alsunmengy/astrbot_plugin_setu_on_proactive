@@ -1,0 +1,35 @@
+{
+  "commands": {
+    "description": "主动消息触发时自动执行的指令列表，可配多条，逐条投递",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": ["/setu 3 爱弥斯"],
+    "hint": "示例：[\"/setu 3 爱弥斯\", \"/签到\"]。留空则回退到 command 字段或内置默认值。"
+  },
+  "command": {
+    "description": "（旧版兼容）主动消息触发时自动执行的单条指令；已配置 commands 时忽略此项",
+    "type": "string",
+    "default": "/setu 3 爱弥斯",
+    "hint": "旧配置保留兼容，新配置请使用 commands 列表。"
+  },
+  "delay_before_execute": {
+    "description": "主动消息最后一段发出后延迟 N 秒再投递指令",
+    "type": "int",
+    "default": 0,
+    "hint": "分段发送时每一段都会触发钩子并重置计时，只有最后一段后的延迟生效——图永远出现在全部文本段落之后，不会插在分段中间。填 10 表示最后一段发出 10 秒后再发图。"
+  },
+  "command_interval": {
+    "description": "多条指令之间的执行间隔（秒）",
+    "type": "int",
+    "default": 0,
+    "hint": "配置多条指令时，逐条投递间隔的秒数，避免瞬间连发被限流。"
+  },
+  "dedup_window_seconds": {
+    "description": "（v1.4.0 起由任务重置机制取代，保留兼容）同一会话去重窗口（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "v1.4.0 起不再需要手动去重：每段触发都会重置延迟任务，一轮主动消息只投递一次。保留此字段仅为兼容旧配置。"
+  }
+}

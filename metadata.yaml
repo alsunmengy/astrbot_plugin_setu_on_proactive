@@ -1,0 +1,21 @@
+name: astrbot_plugin_setu_on_proactive
+display_name: 主动消息联动
+version: 1.4.2
+astrbot_version: ">=4.0"
+author: alsunmengy
+repo: https://github.com/alsunmengy/astrbot_plugin_setu_on_proactive
+social_link: https://github.com/alsunmengy
+short_desc: 主动消息发送时自动执行配置指令（默认 /setu 发图），依赖前置主动消息插件
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - wecom
+  - lark
+  - dingtalk
+  - kook
+tags:
+  - setu
+  - 主动消息
+  - proactive
+desc: 主动消息插件发送消息时，自动向同一会话执行配置的指令（默认 /setu 发图）。依赖前置插件 astrbot_plugin_proactive_chat，只联动单人私聊。

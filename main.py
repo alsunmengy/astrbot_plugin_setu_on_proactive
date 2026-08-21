@@ -1,0 +1,190 @@
+"""AstrBot 插件：主动消息联动 Setu。
+
+当 astrbot_plugin_proactive_chat（主动消息插件）向会话发送主动消息时，
+本插件自动向同一会话投递一条 `/setu` 命令事件，让 setu 插件像收到用户
+真实命令一样正常发图。
+
+实现原理：
+- 主动消息插件每次发送前会触发 AstrBot 的 OnDecoratingResultEvent 钩子
+  （core/message_sender.py 的 _trigger_decorating_hooks），传入一个伪造的
+  AstrMessageEvent（message_id 为空）。
+- 本插件注册该钩子，识别伪造事件后，构造一条带正确会话标识的
+  `/setu` 命令事件，投递进 AstrBot 事件队列，走完整管道执行。
+
+v1.3.0 新增：
+- delay_before_execute：主动消息触发后延迟 N 秒再投递指令。钩子立即返回，
+  延迟在后台任务执行，不阻塞主动消息本身发送。
+- command_interval：多条指令之间的执行间隔秒数，避免瞬间连发被限流。
+
+v1.4.0 变更（修复 setu 图插进主动消息分段中间）：
+- 主动消息插件分段发送时每一段都会触发本钩子。现在每次触发都会**重置**
+  该会话的延迟任务（取消旧任务、新建），只有最后一段触发的任务能存活。
+- delay_before_execute 语义变为：主动消息**最后一段发出后** N 秒再投递指令，
+  图永远出现在全部文本段落之后，不再插在分段中间。
+
+v1.4.1 修复（v1.4.0 引入的触发循环）：
+- setu 发图本身也会触发本钩子（伪造事件 message_id 为空且链含 Image），
+  旧逻辑会再次投递 setu → 无限循环（v1.3.0 的 60s 去重窗口恰好挡住了它）。
+- 修复：识别并跳过"非主动消息"的触发——发送者是 bot 自己、或消息链含
+  Image 组件（setu 发图）时直接返回；同时修复旧任务 done_callback 误删
+  新任务的 bug（按对象身份比较）。
+
+v1.4.2 修复（v1.4.1 未完全修复的触发循环）：
+- v1.4.1 的 sender/Image 检查未覆盖本插件自己注入的事件：注入事件的
+  message_id 为空、sender 等于目标用户、链不含 Image → 三个条件全部放行，
+  注入事件自身再次触发钩子 → 死循环。
+- 修复：钩子入口检查 _setu_on_proactive__injected 标记（本插件注入事件时
+  设置），命中则直接返回，彻底切断自触发链路。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
+from astrbot.core import AstrBotConfig
+from astrbot.core.message.components import Plain
+from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
+from astrbot.core.platform.message_type import MessageType
+
+_DEFAULT_COMMAND = "/setu 3 爱弥斯"
+
+
+class SetuOnProactivePlugin(Star):
+    """主动消息发送时，向同一会话投递配置的指令（默认 setu 发图）。"""
+
+    def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
+        super().__init__(context, config)
+        cfg = config or {}
+        # 优先取 commands 列表（自定义多指令）；兼容旧版单条 command 字段
+        commands = cfg.get("commands", None)
+        if not commands:
+            legacy = str(cfg.get("command", _DEFAULT_COMMAND)).strip() or _DEFAULT_COMMAND
+            commands = [legacy]
+        self._commands = [c.strip() for c in commands if isinstance(c, str) and c.strip()]
+        if not self._commands:
+            self._commands = [_DEFAULT_COMMAND]
+        # 同一会话在窗口内只投递一次，防止主动消息分段/TTS 多段触发重复命令
+        self._dedup_window = float(cfg.get("dedup_window_seconds", 60))
+        # v1.3.0：延迟执行（秒，负值按 0 处理）
+        self._delay_before_execute = max(0.0, float(cfg.get("delay_before_execute", 0)))
+        self._command_interval = max(0.0, float(cfg.get("command_interval", 0)))
+        # v1.4.0：最小安定时间——即使延迟配 0，也至少等这么久再投递，
+        # 覆盖最后一段消息发送到平台的实际送达空隙（秒）
+        self._min_settle = 2.0
+        # v1.4.0：每会话一个待执行任务。分段/TTS 每段触发都会取消旧任务并重建，
+        # 只有最后一段触发的任务能存活 → 一轮主动消息只投递一次，且投递发生在全部段落发出后
+        self._pending_tasks: dict[str, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
+
+    @filter.on_decorating_result()
+    async def on_decorating_result(self, event: AstrMessageEvent) -> None:
+        """发送消息前钩子：识别主动消息插件的伪造事件并投递 setu 命令。"""
+        try:
+            msg_obj = getattr(event, "message_obj", None)
+            if not msg_obj:
+                return
+            # v1.4.2：跳过本插件自己注入的事件，防止触发循环
+            if getattr(msg_obj, "_setu_on_proactive__injected", False):
+                return
+            # 真实平台事件 message_id 非空；主动消息插件构造的伪造事件为空
+            if getattr(msg_obj, "message_id", None):
+                return
+            # v1.4.1：只联动私聊
+            if not event.is_private_chat():
+                return
+            # v1.4.1：跳过非主动消息的触发——setu 发图也会触发本钩子
+            # （message_id 为空 + 链含 Image），若不排除会无限循环投递 setu。
+            # ① 发送者是 bot 自己 → 跳过（主动消息伪造事件的 sender 是目标用户）
+            sender = getattr(msg_obj, "sender", None)
+            sender_id = getattr(sender, "user_id", None) if sender else None
+            session_id = event.get_session_id()
+            if sender_id is not None and sender_id != session_id:
+                logger.debug(f"[setu_on_proactive] 发送者非目标用户({sender_id})，跳过")
+                return
+            # ② 消息链含图片（setu 发图）→ 跳过
+            chain = getattr(msg_obj, "message", None) or []
+            for comp in chain:
+                if getattr(comp, "type", "") == "image" or comp.__class__.__name__ == "Image":
+                    logger.debug(f"[setu_on_proactive] 链含图片组件，跳过（{comp.__class__.__name__}）")
+                    return
+
+            session_key = event.unified_msg_origin
+            async with self._lock:
+                # v1.4.0：重置该会话的延迟任务——分段/TTS 每段都会触发本钩子，
+                # 取消旧任务并新建，只有最后一段触发的任务能存活。
+                # 天然实现"一轮主动消息只投递一次" + "投递发生在全部段落发出后"。
+                old = self._pending_tasks.get(session_key)
+                if old and not old.done():
+                    old.cancel()
+                task = asyncio.create_task(self._delayed_dispatch(event, session_key))
+                self._pending_tasks[session_key] = task
+                # v1.4.1：按对象身份清理，避免旧任务的回调误删新任务
+                task.add_done_callback(
+                    lambda t, k=session_key: self._pending_tasks.pop(k, None)
+                    if self._pending_tasks.get(k) is t else None
+                )
+
+            logger.info(
+                f"[setu_on_proactive] 主动消息触发(重置延迟任务)，投递指令: {self._commands} "
+                f"(最后一段后 {self._delay_before_execute}s, 间隔 {self._command_interval}s) -> {session_key}"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[setu_on_proactive] 钩子异常: {e}", exc_info=True)
+
+    async def _delayed_dispatch(self, source_event: AstrMessageEvent, session_key: str) -> None:
+        """延迟后逐条投递指令（后台任务）。"""
+        try:
+            # 从最后一次触发（最后一段）开始计时；再兜底一个最小安定时间
+            wait = max(self._delay_before_execute, self._min_settle)
+            if wait > 0:
+                logger.info(
+                    f"[setu_on_proactive] 最后一段已触发，{wait}s 后投递 -> {session_key}"
+                )
+                await asyncio.sleep(wait)
+            await self._dispatch_commands(source_event)
+        except asyncio.CancelledError:
+            # 被后续分段的新触发重置，属正常流程
+            logger.debug(f"[setu_on_proactive] 延迟任务被新触发重置 -> {session_key}")
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[setu_on_proactive] 延迟执行异常: {e}", exc_info=True)
+
+    async def _dispatch_commands(self, source_event: AstrMessageEvent) -> None:
+        """逐条构造指令事件并投递到事件队列，走完整管道。"""
+        for index, command in enumerate(self._commands):
+            if index > 0 and self._command_interval > 0:
+                await asyncio.sleep(self._command_interval)
+            await self._dispatch_command(command, source_event)
+
+    async def _dispatch_command(self, command: str, source_event: AstrMessageEvent) -> None:
+        """构造单条指令事件并投递到事件队列。"""
+        target_id = source_event.get_session_id()
+        platform_meta = source_event.platform_meta
+        self_id = source_event.get_self_id() or "bot"
+
+        msg_obj = AstrBotMessage()
+        msg_obj.type = MessageType.FRIEND_MESSAGE
+        msg_obj.session_id = target_id
+        msg_obj.message = [Plain(command)]
+        msg_obj.message_str = command
+        msg_obj.raw_message = command
+        msg_obj.message_id = ""
+        msg_obj.sender = MessageMember(user_id=target_id)
+        msg_obj.self_id = self_id
+        msg_obj._setu_on_proactive__injected = True
+
+        new_event = AstrMessageEvent(
+            message_str=command,
+            message_obj=msg_obj,
+            platform_meta=platform_meta,
+            session_id=target_id,
+        )
+        queue = self.context.get_event_queue()
+        await queue.put(new_event)
+        logger.info(
+            f"[setu_on_proactive] 已投递指令事件: {command} -> {new_event.unified_msg_origin}"
+        )
